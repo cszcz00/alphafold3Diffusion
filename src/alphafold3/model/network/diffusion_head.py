@@ -344,6 +344,8 @@ def sample(
 
     return (key, positions_out, noise_level), positions_out
 
+
+
   num_samples = config.num_samples
 
   noise_levels = noise_schedule(jnp.linspace(0, 1, config.steps + 1))
@@ -367,3 +369,82 @@ def sample(
   final_dense_atom_mask = jnp.tile(mask[None], (num_samples, 1, 1))
 
   return {'atom_positions': positions_out, 'mask': final_dense_atom_mask}
+
+
+def sample_tracking_trajectory(
+    denoising_step: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+    batch: feat_batch.Batch,
+    key: jnp.ndarray,
+    config: SampleConfig,
+) -> dict[str, jnp.ndarray]:
+  """Sample using denoiser on batch.
+
+  Args:
+    denoising_step: the denoising function.
+    batch: the batch
+    key: random key
+    config: config for the sampling process (e.g. number of denoising steps,
+      etc.)
+
+  Returns:
+    a dict
+      {
+         'atom_positions': jnp.array(...)       # shape (<common_axes>, 3)
+         'mask': jnp.array(...)                 # shape (<common_axes>,)
+      }
+    where the <common_axes> are
+    (num_samples, num_tokens, max_atoms_per_token)
+  """
+
+  mask = batch.predicted_structure_info.atom_mask
+
+  def apply_denoising_step(carry, noise_level):
+    key, positions, noise_level_prev, positions_history = carry
+    key, key_noise, key_aug = jax.random.split(key, 3)
+
+    positions = random_augmentation(
+        rng_key=key_aug, positions=positions, mask=mask
+    )
+
+    gamma = config.gamma_0 * (noise_level > config.gamma_min)
+    t_hat = noise_level_prev * (1 + gamma)
+
+    noise_scale = config.noise_scale * jnp.sqrt(t_hat**2 - noise_level_prev**2)
+    noise = noise_scale * jax.random.normal(key_noise, positions.shape)
+    positions_noisy = positions + noise
+
+    positions_denoised = denoising_step(positions_noisy, t_hat)
+    grad = (positions_noisy - positions_denoised) / t_hat
+
+    d_t = noise_level - t_hat
+    positions_out = positions_noisy + config.step_scale * d_t * grad
+
+    positions_history = jnp.append(positions_history, positions_out, axis=0)
+
+    return (key, positions_out, noise_level, positions_history), positions_out
+
+  num_samples = config.num_samples
+
+  noise_levels = noise_schedule(jnp.linspace(0, 1, config.steps + 1))
+
+  key, noise_key = jax.random.split(key)
+  positions = jax.random.normal(noise_key, (num_samples,) + mask.shape + (3,))
+  positions *= noise_levels[0]
+
+  init = (
+    jax.random.split(key, num_samples),
+    positions,
+    jnp.tile(noise_levels[None, 0], (num_samples,)),
+    jnp.zeros((0,) + positions.shape[1:], dtype=positions.dtype),  # Empty history
+  )
+
+  apply_denoising_step = hk.vmap(
+    apply_denoising_step, in_axes=(0, None), split_rng=(not hk.running_init())
+  )
+
+  result, _ = hk.scan(apply_denoising_step, init, noise_levels[1:], unroll=4)
+  _, positions_out, _, positions_history = result
+
+  final_dense_atom_mask = jnp.tile(mask[None], (num_samples, 1, 1))
+
+  return {'atom_positions': positions_out, 'position_trajectory': positions_history, 'mask': final_dense_atom_mask}
